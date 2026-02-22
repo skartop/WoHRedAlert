@@ -1,0 +1,15 @@
+# Dependency directories
+node_modules/
+
+# Logs
+*.log
+
+# MacOS files
+.DS_Store
+
+# Chrome extension packages
+*.crx
+*.zip
+
+# Local environment variables
+.env

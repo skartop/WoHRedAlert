@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "WoHRedAlert",
+  "description": "Read-only Ways of History attack alert extension. Personal notifications only; no automation or data sharing.",
+  "short_name": "WoHRedAlert",
+  "version": "0.1.1",
+  "permissions": ["storage", "notifications", "scripting", "tabs"],
+  "host_permissions": [
+    "https://*.waysofhistory.com/*",
+    "https://api.telegram.org/*",
+    "https://discord.com/*",
+    "https://*.discord.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.waysofhistory.com/*"],
+      "js": ["src/content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "WoH Monitor",
+    "default_popup": "src/popup.html"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

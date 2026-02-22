@@ -1,0 +1,7 @@
+﻿body { font-family: Arial, sans-serif; width: 320px; padding: 10px; }
+h3 { margin: 0 0 10px; }
+.field { margin: 8px 0; }
+label { display: block; font-size: 12px; margin-bottom: 2px; }
+input[type="text"], input[type="password"], input[type="number"] { width: 100%; box-sizing: border-box; }
+button { margin-right: 6px; margin-top: 8px; }
+pre { font-size: 11px; background: #f4f4f4; padding: 6px; white-space: pre-wrap; }

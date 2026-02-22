@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "WoH Monitor",
+  "description": "Read-only Ways of History monitor for attacks, battles, and build queues.",
+  "version": "0.1.1",
+  "permissions": [
+    "storage",
+    "notifications",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.waysofhistory.com/*",
+    "https://api.telegram.org/*",
+    "https://discord.com/*",
+    "https://*.discord.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.waysofhistory.com/*"],
+      "js": ["src/content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "WoH Monitor",
+    "default_popup": "src/popup.html"
+  }
+}
