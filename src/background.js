@@ -7,16 +7,48 @@ const DEFAULTS = {
   discordWebhookUrl: ""
 };
 
-const frameStateByTab = new Map(); // tabId -> Map(frameId -> status)
-const alertSentAtByKey = new Map();
-const alertSeenOnceKeys = new Set();
+const frameStateByTab = new Map();
 const lastMainScanByTab = new Map();
+const lastScanTsByTab = new Map(); // throttle: one scan per tab per poll cycle
 
+// ---- Persistent deduplication ----
+// In-memory cache backed by chrome.storage.local so it survives service worker restarts.
+let alertSeenKeys = new Set();
+let alertSeenKeysLoaded = false;
+
+async function loadSeenKeys() {
+  if (alertSeenKeysLoaded) return;
+  try {
+    const data = await chrome.storage.local.get({ alertSeenKeys: [] });
+    alertSeenKeys = new Set(data.alertSeenKeys || []);
+  } catch { /* ignore */ }
+  alertSeenKeysLoaded = true;
+}
+
+async function persistSeenKeys() {
+  try {
+    // Keep max 500 keys to avoid unbounded growth; trim oldest (FIFO via array order).
+    const arr = [...alertSeenKeys];
+    const trimmed = arr.length > 500 ? arr.slice(arr.length - 500) : arr;
+    await chrome.storage.local.set({ alertSeenKeys: trimmed });
+  } catch { /* ignore */ }
+}
+
+async function canSendAlertKey(key) {
+  await loadSeenKeys();
+  if (alertSeenKeys.has(key)) return false;
+  alertSeenKeys.add(key);
+  await persistSeenKeys();
+  return true;
+}
+
+// ---- Settings ----
 async function getSettings() {
   const obj = await chrome.storage.sync.get(DEFAULTS);
   return { ...DEFAULTS, ...obj };
 }
 
+// ---- Network helpers ----
 async function postJson(url, body) {
   const res = await fetch(url, {
     method: 'POST',
@@ -26,16 +58,7 @@ async function postJson(url, body) {
   return res.ok;
 }
 
-function canSendAlertKey(key, cooldownMs) {
-  if (alertSeenOnceKeys.has(key)) return false;
-  const now = Date.now();
-  const last = alertSentAtByKey.get(key) || 0;
-  if (now - last < (cooldownMs || DEFAULTS.alertCooldownMs)) return false;
-  alertSentAtByKey.set(key, now);
-  alertSeenOnceKeys.add(key);
-  return true;
-}
-
+// ---- Frame state tracking ----
 function setFrameState(tabId, frameId, status) {
   if (tabId == null || frameId == null) return;
   if (!frameStateByTab.has(tabId)) frameStateByTab.set(tabId, new Map());
@@ -47,24 +70,25 @@ function pickBestFrameStatus(tabId) {
   const m = frameStateByTab.get(tabId);
   if (!m || m.size === 0) return null;
   const all = [...m.values()];
-
   const withTowns = all.filter(s => s?.hasTowns && s?.townCount > 0);
   if (withTowns.length > 0) return withTowns.sort((a, b) => b.townCount - a.townCount)[0];
-
   const withWofh = all.filter(s => s?.hasWofh);
   if (withWofh.length > 0) return withWofh[0];
-
   const top = all.find(s => s?.isTop);
   return top || all[0];
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => frameStateByTab.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  frameStateByTab.delete(tabId);
+  lastScanTsByTab.delete(tabId);
+});
 
 chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.sync.get(null);
   await chrome.storage.sync.set({ ...DEFAULTS, ...current });
 });
 
+// ---- Notifications ----
 async function createChromeNotification(title, message) {
   return new Promise((resolve) => {
     try {
@@ -123,9 +147,16 @@ async function dispatchAlert(msg = {}) {
   return result;
 }
 
+// ---- Message handler ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    // Content script direct alerts — route through dedup
     if (msg?.type === 'WOH_ALERT') {
+      const key = msg.key || `direct:${msg.title}:${msg.detail}`;
+      if (!(await canSendAlertKey(key))) {
+        sendResponse({ ok: true, deduplicated: true });
+        return;
+      }
       await dispatchAlert(msg);
       sendResponse({ ok: true });
       return;
@@ -149,6 +180,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'missing tab/frame' });
         return;
       }
+
+      // Throttle: only one MAIN scan per tab per 4 seconds (< poll interval).
+      const lastScan = lastScanTsByTab.get(tabId) || 0;
+      if (Date.now() - lastScan < 4000) {
+        sendResponse({ ok: true, throttled: true });
+        return;
+      }
+      lastScanTsByTab.set(tabId, Date.now());
 
       let entries = [];
       try {
@@ -194,8 +233,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               if (v == null || v === '') return null;
               const n = Number(v);
               if (!Number.isFinite(n)) return null;
-              if (n > 1e12) return n;      // already ms
-              if (n > 1e9) return n * 1000; // epoch sec
+              if (n > 1e12) return n;
+              if (n > 1e9) return n * 1000;
               return null;
             };
 
@@ -236,7 +275,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const fromMyTown = !!src && myTownIds.has(src);
                 if (!(atMyTown && !fromMyTown)) continue;
 
-                // Noise filter: ignore synthetic/unknown origin town id 0.
                 if (String(src) === '0') continue;
 
                 const etaRaw = readEtaRaw(e);
@@ -247,18 +285,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const speedText = speedRaw == null || speedRaw === '' ? 'unknown' : String(speedRaw);
                 const typeText = String(e?.type ?? e?.kind ?? e?.name ?? e?.title ?? e?.data?.type ?? 'movement');
 
-                // Filter non-military movements (merchant/trade/transport).
                 const blob = JSON.stringify(e).toLowerCase();
                 const merchantLike = /(merchant|trade|trader|market|caravan|transport|shipment|resource)/i.test(blob + ' ' + typeText);
                 const typeNum = Number(typeText);
                 const knownNonCombatType = Number.isFinite(typeNum) && [102, 108, 201].includes(typeNum);
-                // Type-level hard block for known non-combat movements.
                 if (knownNonCombatType) continue;
                 const hasArmySignal = /(army|troop|unit|soldier|infantry|cavalry|archer|siege)/i.test(blob);
                 if (merchantLike && !hasArmySignal) continue;
 
-                // Deduplicate same incoming shown in multiple sources/lists.
-                const dedupe = `main:fleet:${src || '?'}:${dest}:${etaMs || 'na'}`;
+                // Stable dedupe key: src + dest + etaMs (does not change across polls)
+                const dedupe = `fleet:${src || '?'}:${dest}:${etaMs || 'na'}`;
                 pushAlert(
                   dedupe,
                   'Incoming fleet',
@@ -274,7 +310,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 if (!townId || !myTownIds.has(townId)) continue;
                 const id = String(b.id ?? b.battleId ?? `${townId}:${b.time ?? 'battle'}`);
                 if (!id) continue;
-                pushAlert(`main:battle:${id}`, 'Battle at your town', `Battle #${id} at town ${townId}`);
+                pushAlert(`battle:${id}`, 'Battle at your town', `Battle #${id} at town ${townId}`);
               }
             };
 
@@ -283,8 +319,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             scanIncomingFleets(W.movements?.list);
             scanIncomingFleets(W.units?.movements);
             scanBattles(W.battles?.list);
-
-            // UI fallback disabled due to false positives.
 
             return { hasWofh: true, townCount: myTownIds.size, alerts };
           }
@@ -297,10 +331,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       const scan = entries?.[0]?.result || { hasWofh: false, townCount: 0, alerts: [] };
-      const s = await getSettings();
       let sent = 0;
       for (const a of (scan.alerts || [])) {
-        if (!canSendAlertKey(a.key, s.alertCooldownMs)) continue;
+        if (!(await canSendAlertKey(a.key))) continue;
         await dispatchAlert(a);
         sent += 1;
       }
@@ -336,13 +369,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, status: 'NO_FRAME_DATA', running: false, checks: 0, towns: 0 });
         return;
       }
-
       const statusLabel = best.hasTowns
         ? 'WORLD_READY'
         : best.hasWofh
           ? 'WAITING_FOR_TOWNS'
           : 'WAITING_FOR_WORLD_FRAME';
-
       sendResponse({
         ok: true,
         status: statusLabel,
@@ -376,7 +407,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: String(e) });
         return;
       }
-
       const frames = entries.map(e => ({
         frameId: e.frameId,
         href: e.result?.href || '',
@@ -384,7 +414,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         hasWofh: !!e.result?.hasWofh,
         townCount: e.result?.townCount || 0
       }));
-
       const tabMap = frameStateByTab.get(tabId) || new Map();
       for (const f of frames) {
         const prev = tabMap.get(f.frameId) || {};
@@ -399,7 +428,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           isTop: f.isTop
         });
       }
-
       const best = pickBestFrameStatus(tabId);
       const status = !best ? 'NO_FRAME_DATA' : (best.hasTowns ? 'WORLD_READY' : best.hasWofh ? 'WAITING_FOR_TOWNS' : 'WAITING_FOR_WORLD_FRAME');
       sendResponse({ ok: true, status, best, frames });
